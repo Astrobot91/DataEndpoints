@@ -1,0 +1,13 @@
+selenium
+pyotp
+requests
+boto3
+watchtower
+awslambdaric
+polars
+pandas
+numpy
+aiohttp
+requests
+fastapi
+uvicorn
