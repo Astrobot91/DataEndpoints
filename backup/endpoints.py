@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List
 
-from brokers.upstox.upstox_broker import UpstoxBroker
+from brokers.upstox.broker import UpstoxBroker
 from logger import get_logger
 
 router = APIRouter()

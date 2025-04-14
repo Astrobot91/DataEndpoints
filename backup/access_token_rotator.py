@@ -1,9 +1,16 @@
+"""
+Upstox token rotator implementation.
+
+This module contains the UpstoxTokenRotator class which implements the BaseTokenRotator
+interface for the Upstox trading platform.
+"""
+
 import os
 import json
 import boto3
 import logging
 from logger import get_logger
-from upstox_authenticator import UpstoxAuthenticator
+from brokers.upstox.authenticator import UpstoxAuthenticator
 
 UPSTOX_CONFIG_SECRET_NAME = os.getenv("UPSTOX_CONFIG_SECRET_NAME", "my_upstox_config")
 UPSTOX_TOKEN_SECRET_NAME = os.getenv("UPSTOX_TOKEN_SECRET_NAME", "my_upstox_access_token")

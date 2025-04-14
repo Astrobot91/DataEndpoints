@@ -1,30 +1,63 @@
-import json
-import boto3
+"""
+Upstox broker implementation.
+
+This module contains the UpstoxBroker class which implements the BaseBroker
+interface for the Upstox trading platform.
+"""
+
 import gzip
+import boto3
+import json
 import logging
 import aiohttp
 import polars as pl
 from io import BytesIO
 from datetime import datetime, timedelta
-from brokers.basebroker import BaseBroker
-from typing import List, Dict, Any
+from typing import Dict, List, Any, Optional
+
+from ..base.broker import BaseBroker
+from .token_rotator import UpstoxTokenRotator
 
 
 class UpstoxBroker(BaseBroker):
+    """
+    Upstox broker implementation.
+    
+    This class implements the BaseBroker interface for the Upstox trading platform.
+    
+    Attributes:
+        broker_name (str): The name of the broker ('Upstox').
+        logger (logging.Logger): Logger instance for the broker.
+        access_token (str): The current Upstox API access token.
+        upstox_master_data (Dict): The Upstox master data containing instrument information.
+        upstox_master_df (pl.DataFrame): DataFrame representation of the master data.
+    """
     
     BASE_URL = "https://api.upstox.com/v2"
     BASE_ORDER_URL = "https://api-hft.upstox.com/v2"
-
-    def __init__(self, account_name: str, logger: logging.Logger):
-        self.account_name = account_name
-        self.broker_name = 'Upstox'
-        self.logger = logger
-        self.access_token = None
-
-    async def initialize(self):
+    
+    def _get_broker_name(self) -> str:
+        """
+        Get the name of the broker.
+        
+        Returns:
+            str: The name of the broker ('Upstox').
+        """
+        return 'Upstox'
+    
+    async def initialize(self) -> None:
+        """
+        Initialize the Upstox broker with necessary configurations and data.
+        
+        This method fetches the access token, retrieves the master data,
+        and prepares the broker for use.
+        
+        Raises:
+            Exception: If initialization fails.
+        """
         try:
-            self.logger.info(f'Initializing UpstoxBroker for {self.account_name}')
-            self.access_token = self.fetch_upstox_access_token()
+            self.logger.info(f'Initializing UpstoxBroker')
+            self.access_token = await self.fetch_access_token()
             self.upstox_master_data = await self._get_upstox_master_data()
             self.upstox_master_df = pl.DataFrame(data=self.upstox_master_data)
             if self.upstox_master_df is None:
@@ -36,39 +69,20 @@ class UpstoxBroker(BaseBroker):
     async def _get_upstox_master_data(self):
         return await super()._get_upstox_master_data()
 
-    async def ltp_quote(self, ltp_request_data: List[Dict[str, str]]) -> float:
+    async def ltp_quote(self, ltp_request_data: List[Dict[str, str]]) -> Dict[str, Any]:
         """
-        Asynchronously retrieves the Last Traded Price (LTP) for a specified exchange token.
-
-        This function fetches the LTP for a given exchange token from Upstox's market quote API. 
-        It verifies that the token exists in the local instrument data, then retrieves the price data.
-
+        Get last traded price quotes for specified instruments.
+        
         Args:
-            exchange_token (str): The unique identifier for the instrument on the exchange.
-            exchange (str): Name of the exchange.
-
+            ltp_request_data (List[Dict[str, str]]): List of dictionaries containing
+                instrument identifiers like exchange_token, exchange, etc.
+                
         Returns:
-            float: The last traded price of the instrument associated with the given exchange token.
-
+            Dict[str, Any]: Dictionary containing LTP data for requested instruments.
+            
         Raises:
-            ValueError: If the exchange token is not found in the instrument data.
-            Exception: If the API request fails or if LTP retrieval is unsuccessful due to server issues or invalid responses.
-
-        Example:
-            ltp_request_data = [
-                    {
-                        "exchange_token": "55555",
-                        "exchange": "NSE"
-                    },
-                    {
-                        "exchange_token": "44444",
-                        "exchange": "BSE"
-                    }
-                ]
-
-        Notes:
-            - Requires `instrument_df` to contain the exchange token and `instrument_key` mappings.
-            - Requires a valid Upstox API access token and active session to function.
+            ValueError: If instrument identifiers are invalid.
+            Exception: If quote retrieval fails.
         """
         try:
             instrument_key_list = []
@@ -109,7 +123,7 @@ class UpstoxBroker(BaseBroker):
                             else:
                                 error_msg = f'LTP response data missing for: {params}'
                                 self.logger.error(error_msg)
-                                raise ValueError
+                                raise ValueError(error_msg)
                         else:
                             error_msg = f'LTP response retrieval unsuccessful. Details: {ltp_response}'
                             self.logger.error(error_msg)
@@ -121,15 +135,11 @@ class UpstoxBroker(BaseBroker):
                         raise Exception(error_msg)
         except Exception as e:
             self.logger.error(f'Exception during LTP response retrieval: {e}')
+            raise
 
     async def convert_quote(self, ltp_response_data: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         """
         Converts instrument tokens in the quote data to exchange tokens.
-
-        This function takes a dictionary of quote data where the keys are instrument tokens,
-        and converts the instrument tokens to their corresponding exchange tokens using the
-        instrument DataFrame (`self.instrument_df`). It returns a new dictionary with exchange
-        tokens as keys and the original quote data as values.
 
         Args:
             ltp_response_data (dict): A dictionary where each value contains quote data with an 'instrument_token' key.
@@ -162,7 +172,7 @@ class UpstoxBroker(BaseBroker):
                 self.logger.error(f"Error converting instrument token {instrument_key}: {e}")
                 raise
         
-        return output_dict  
+        return output_dict
 
     async def historical_data(
             self,
@@ -172,41 +182,24 @@ class UpstoxBroker(BaseBroker):
             interval: str,
             from_date: str,
             to_date: str
-            ) -> Dict:
+            ) -> Dict[str, Any]:
         """
-        Retrieves historical candle data for a specified exchange token from Upstox.
-
+        Get historical candle data for a specified instrument.
+        
         Args:
-            exchange_token (str): The unique identifier for the instrument within the Upstox API.
-            interval (str): The time interval for the data (e.g., '1minute', '5minute', '15minute', '1day').
-            from_date (str): The starting date for the historical data in 'YYYY-MM-DD' format.
-            to_date (str): The ending date for the historical data in 'YYYY-MM-DD' format.
-
+            exchange (str): Exchange name (e.g., 'NSE', 'BSE').
+            exchange_token (str): Exchange token for the instrument.
+            instrument_type (str): Type of instrument (e.g., 'EQ', 'FUT').
+            interval (str): Time interval for candles (e.g., '1minute', '1day').
+            from_date (str): Start date in 'YYYY-MM-DD' format.
+            to_date (str): End date in 'YYYY-MM-DD' format.
+            
         Returns:
-            Dict: A dictionary containing historical candle data with keys such as:
-                - `datetime`: The timestamp for each data point.
-                - `open`: The opening price of the instrument.
-                - `high`: The highest price of the instrument.
-                - `low`: The lowest price of the instrument.
-                - `close`: The closing price of the instrument.
-                - `volume`: The trading volume.
-                - `oi`: The open interest.
-
+            Dict[str, Any]: Dictionary containing historical candle data.
+            
         Raises:
-            ValueError: If the `exchange_token` is not found in the Upstox master data.
-            Exception: For any errors related to data retrieval or API response issues.
-
-        Example:
-            historical_df = await upstox_broker.historical_data(
-                exchange="NSE"
-                exchange_token="12345", 
-                interval="1day", 
-                from_date="2023-01-01", 
-                to_date="2023-06-30"
-            )
-
-            This example retrieves daily OHLC data for the instrument with `exchange_token` "12345" from 
-            January 1, 2023, to June 30, 2023, and prints the resulting DataFrame.
+            ValueError: If parameters are invalid.
+            Exception: If data retrieval fails.
         """
         try:
             instrument_rows = self.upstox_master_df.filter(
@@ -236,13 +229,15 @@ class UpstoxBroker(BaseBroker):
                         hist_response = await response.json()
                         if hist_response.get('status') == 'success':
                             if 'data' in hist_response:
-                                data = await self._convert_to_polars_df(data=hist_response['data'],
-                                                                        exchange=exchange,
-                                                                        exchange_token=exchange_token,
-                                                                        instrument_type=instrument_type,
-                                                                        interval=interval,
-                                                                        from_date=from_date,
-                                                                        to_date=to_date)
+                                data = await self._convert_to_polars_df(
+                                    data=hist_response['data'],
+                                    exchange=exchange,
+                                    exchange_token=exchange_token,
+                                    instrument_type=instrument_type,
+                                    interval=interval,
+                                    from_date=from_date,
+                                    to_date=to_date
+                                )
                                 self.logger.info(f'Historical data for: {exchange_token} from: {from_date} to: {to_date} retrieved.')
                                 return data.to_dicts()
                             else:
@@ -277,8 +272,10 @@ class UpstoxBroker(BaseBroker):
         Converts provided candle data to a Polars DataFrame with a timezone-adjusted datetime column.
         
         Args:
-            exchange_token (str): The exchange token of the instrument.
             data (dict): Dictionary containing candle data with datetime and OHLC values.
+            exchange_token (str): The exchange token of the instrument.
+            instrument_type (str): Type of instrument (e.g., 'EQ', 'FUT').
+            exchange (str): Exchange name (e.g., 'NSE', 'BSE').
             interval (str): The interval for the historical data (e.g., '1minute', '5minute', '1day').
             from_date (str): The start date for the historical data in 'YYYY-MM-DD' format.
             to_date (str): The end date for the historical data in 'YYYY-MM-DD' format.
@@ -304,7 +301,11 @@ class UpstoxBroker(BaseBroker):
                 .dt.convert_time_zone("Asia/Kolkata")
                 .dt.strftime("%Y-%m-%d %H:%M:%S")
             )
-            todays_mkt_quote = await self.full_market_quote(exchange_token=exchange_token, exchange=exchange, instrument_type=instrument_type)
+            todays_mkt_quote = await self.full_market_quote(
+                exchange_token=exchange_token, 
+                exchange=exchange, 
+                instrument_type=instrument_type
+            )
             if todays_mkt_quote['ohlc']:
                 row = {
                     'datetime': todays_mkt_quote['timestamp'],
@@ -332,8 +333,9 @@ class UpstoxBroker(BaseBroker):
                     pl.col("volume").cast(pl.Int64),
                     pl.col("oi").cast(pl.Int64)
                 ])
-
-                combined_df = pl.concat([df, todays_df])
+                
+                if to_date == datetime.now().strftime("%Y-%m-%d"):
+                    combined_df = pl.concat([df, todays_df])
                 combined_df = combined_df.sort('datetime')
                 return combined_df
             else:
@@ -343,106 +345,26 @@ class UpstoxBroker(BaseBroker):
             self.logger.warning(f"Historical data for exchange token: {exchange_token} from: {from_date} to: {to_date} at interval: {interval} not found.")
             return pl.DataFrame(data={}, strict=False)
 
-    async def ohlc_quote(
-            self,
-            exchange: str,
-            exchange_token: str,
-            instrument_type: str,
-            interval: str
-            ) -> Dict[str, float]:
+    async def full_market_quote(
+        self,
+        exchange_token: str,
+        exchange: str,
+        instrument_type: str
+    ) -> Dict[str, Any]:
         """
-        Asynchronously retrieves Open-High-Low-Close (OHLC) data for a specified exchange token and time interval.
-
-        This function fetches the OHLC data for a given exchange token from Upstox's market quote API,
-        for a specified time interval such as '1day' or '5min'. It verifies that the token exists in 
-        the local instrument data before making the request.
-
-        Args:
-            exchange_token (str): The unique identifier for the instrument on the exchange.
-            interval (str): The time interval for OHLC data (e.g., '1d' (1 day), '1I' (1 minute), '5I' (5 minutes)).
-            exchange (str): Name of the exchange.
-
-        Returns:
-            Dict[str, float]: A dictionary containing the OHLC data, with keys 'open', 'high', 'low', and 'close' 
-                              representing respective prices.
-
-        Raises:
-            ValueError: If the exchange token is not found in the instrument data.
-            Exception: If the API request fails or if OHLC data retrieval is unsuccessful due to server issues or invalid responses.
+        Get full market quote for a specified instrument.
         
-        Example:
-            exchange_token = '74989'
-            interval = '1day'
-            ohlc_data = await broker.ohlc_quote(exchange_token, interval)
-            print(f"OHLC data: {ohlc_data}")
-        """
-        try:
-            instrument_rows = self.upstox_master_df.filter(
-                (pl.col('exchange_token') == exchange_token),
-                (pl.col('exchange') == exchange),
-                (pl.col('instrument_type') == instrument_type)
-            )
-            if instrument_rows.is_empty():
-                error_msg = f'exchange_token: {exchange_token} not found in the upstox master file.'
-                self.logger.error(error_msg)
-                raise ValueError(error_msg)
-            instrument_key = instrument_rows['instrument_key'][0]
-
-            url = f'{self.BASE_URL}/market-quote/ohlc'
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'Accept': 'application/json'
-            }
-            params = {'instrument_key': instrument_key, 'interval': interval}
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url=url, headers=headers, params=params) as response:
-                    if response.status == 200:
-                        ohlc_response = await response.json()
-                        if ohlc_response.get('status') == 'success':
-                            if 'data' in ohlc_response:
-                                data = await self.convert_quote(exchange_tokens=ohlc_response['data'])
-                                return data[exchange_token]['ohlc']
-                            else:
-                                error_msg = f'OHLC response data missing for: {params}'
-                                self.logger.error(error_msg)
-                                raise ValueError(error_msg)
-                        else:
-                            error_msg = f'OHLC response retrieval unsuccessful. Details: {ohlc_response}'
-                            self.logger.error(error_msg)
-                            raise Exception(error_msg)
-                    else:
-                        error_text = await response.text()
-                        error_msg = f'Failed to retrieve OHLC response: {response.status} - {error_text}'
-                        self.logger.error(error_msg)
-                        raise Exception(error_msg)         
-        except Exception as e:
-            self.logger.error(f'Exception during OHLC response retrieval: {e}')      
-
-    async def full_market_quote(self, exchange: str, exchange_token: str, instrument_type: str) -> Dict[str, Any]:
-        """
-        Asynchronously retrieves the full market quote for a specified exchange token.
-
-        This function fetches comprehensive market data for a given exchange token from Upstox's market 
-        quote API. It verifies the existence of the exchange token in the instrument data before making 
-        the request, ensuring that only valid tokens are processed.
-
         Args:
-            exchange_token (str): The unique identifier for the instrument on the exchange.
-            exchange (str): Name of the exchange.
-
+            exchange_token (str): Exchange token for the instrument.
+            exchange (str): Exchange name (e.g., 'NSE', 'BSE').
+            instrument_type (str): Type of instrument (e.g., 'EQ', 'FUT').
+            
         Returns:
-            Dict[str, Any]: A dictionary containing the full market quote data for the specified 
-                            exchange token, including details such as bid-ask prices, 
-                            last traded price, volume, and other key metrics.
-
+            Dict[str, Any]: Dictionary containing full market quote data.
+            
         Raises:
-            ValueError: If the exchange token is not found in the instrument data.
-            Exception: If the API request fails or if full market quote retrieval is unsuccessful 
-                       due to server issues or invalid responses.
-
-        Example:
-            exchange_token = '74989'
+            ValueError: If parameters are invalid.
+            Exception: If quote retrieval fails.
         """
         try:
             instrument_rows = self.upstox_master_df.filter(
@@ -451,7 +373,7 @@ class UpstoxBroker(BaseBroker):
                 (pl.col('instrument_type') == instrument_type)
             )
             if instrument_rows.is_empty():
-                error_msg = f'exchange_token: {exchange_token} not found in the upstox master file.'
+                error_msg = f"exchange_token: {exchange_token} not found in upstox master file."
                 self.logger.error(error_msg)
                 raise ValueError(error_msg)
             instrument_key = instrument_rows['instrument_key'][0]
@@ -468,61 +390,37 @@ class UpstoxBroker(BaseBroker):
                     if response.status == 200:
                         quote_response = await response.json()
                         if quote_response.get('status') == 'success':
-                            if 'data' in quote_response:
-                                data = await self.convert_quote(ltp_response_data=quote_response['data'])
-                                return data[exchange_token]
+                            if 'data' in quote_response and instrument_key in quote_response['data']:
+                                return quote_response['data'][instrument_key]
                             else:
-                                error_msg = f'Full market quote data missing for: {params}'
+                                error_msg = f'Quote data missing for instrument: {instrument_key}'
                                 self.logger.error(error_msg)
-                                raise ValueError
+                                return {}
                         else:
-                            error_msg = f'Full market quote retrieval unsuccessful. Details: {quote_response}'
+                            error_msg = f'Quote retrieval unsuccessful. Details: {quote_response}'
                             self.logger.error(error_msg)
                             raise Exception(error_msg)
                     else:
                         error_text = await response.text()
-                        error_msg = f'Failed to retrieve full market quote: {response.status} - {error_text}'
+                        error_msg = f'Failed to retrieve quote: {response.status} - {error_text}'
                         self.logger.error(error_msg)
-                        raise Exception(error_msg)         
+                        return {}
         except Exception as e:
-            self.logger.error(f'Exception during full market quote retrieval: {e}')      
+            self.logger.error(f'Exception during quote retrieval: {e}')
+            return {}
 
-    def fetch_upstox_access_token(self, region_name: str = "ap-south-1") -> str:
+    async def fetch_access_token(self) -> str:
         """
-        Fetches the Upstox access token from AWS Secrets Manager.
-
-        Args:
-            region_name (str): AWS region where the secret is stored. Default is 'ap-south-1'.
-
+        Fetch a new access token for the Upstox API.
+        
         Returns:
-            str: The Upstox access token.
-
+            str: The new access token.
+        
         Raises:
-            Exception: If unable to fetch or parse the secret.
+            Exception: If token fetching fails.
         """
-        secret_name = "my_upstox_access_token"
-
-        session = boto3.session.Session()
-        client = session.client(
-            service_name='secretsmanager',
-            region_name=region_name
+        token_rotator = UpstoxTokenRotator(
+            config=self.config,
+            logger=self.logger
         )
-
-        try:
-            get_secret_value_response = client.get_secret_value(SecretId=secret_name)
-        except Exception as e:
-            raise Exception(f"Error fetching secret {secret_name}: {e}")
-
-        if 'SecretString' in get_secret_value_response:
-            secret = get_secret_value_response['SecretString']
-        else:
-            secret = get_secret_value_response['SecretBinary'].decode('utf-8')
-
-        try:
-            secret_data = json.loads(secret)
-            access_token = secret_data.get("access_token")
-            if not access_token:
-                raise Exception("Key 'access_token' not found in secret JSON.")
-            return access_token
-        except json.JSONDecodeError:
-            return secret
+        return token_rotator.get_current_token()

@@ -1,3 +1,10 @@
+"""
+Upstox authenticator implementation.
+
+This module contains the UpstoxAuthenticator class which implements the BaseAuthenticator
+interface for the Upstox trading platform.
+"""
+
 import time
 import pyotp
 import requests
@@ -9,24 +16,38 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.chrome.options import Options
 from urllib.parse import urlparse, parse_qs
+from typing import Dict, Any
 
-class UpstoxAuthenticator:
+from ..base.authenticator import BaseAuthenticator
+
+
+class UpstoxAuthenticator(BaseAuthenticator):
     """
-    Automates the Upstox login flow via Selenium to obtain a new access token.
+    Upstox authenticator implementation.
+    
+    This class implements the BaseAuthenticator interface for the Upstox trading platform.
+    It automates the Upstox login flow via Selenium to obtain a new access token.
+        
+    Attributes:
+        config (Dict[str, Any]): Configuration parameters for authentication.
+        logger (logging.Logger): Logger instance for the authenticator.
     """
-    def __init__(self, config: dict, logger: logging.Logger):
+    
+    def __init__(self, config: Dict[str, Any], logger: logging.Logger):
         """
+        Initialize the authenticator with configuration and logger.
+        
         Args:
-            config (dict): Dictionary containing upstox credentials and settings.
-            logger (logging.Logger): The logger instance.
+            config (Dict[str, Any]): Configuration parameters for authentication.
+            logger (logging.Logger): Logger instance for the authenticator.
         """
-        self.logger = logger
-        self.api_key = config["API_KEY"]
-        self.api_secret = config["API_SECRET"]
-        self.redirect_uri = config["REDIRECT_URL"]
-        self.phone_no = config["PHONE_NO"]
-        self.totp_key = config["TOTP_KEY"]
-        self.pin_code = config["PIN_CODE"]
+        super().__init__(config, logger)
+        self.api_key = config.get("API_KEY")
+        self.api_secret = config.get("API_SECRET")
+        self.redirect_uri = config.get("REDIRECT_URL")
+        self.phone_no = config.get("PHONE_NO")
+        self.totp_key = config.get("TOTP_KEY")
+        self.pin_code = config.get("PIN_CODE")
         
         self.access_token = None
         self.driver = None
@@ -34,6 +55,12 @@ class UpstoxAuthenticator:
     def fetch_access_token(self) -> str:
         """
         Main method to automate login and return new Upstox access token.
+        
+        Returns:
+            str: The new access token.
+            
+        Raises:
+            Exception: If authentication fails.
         """
         auth_code = self._perform_login()
         if not auth_code:
@@ -42,9 +69,15 @@ class UpstoxAuthenticator:
         new_token = self._get_access_token(auth_code)
         return new_token
 
-    def _perform_login(self):
+    def _perform_login(self) -> str:
         """
         Automates the login process via Selenium, returning the authorization code.
+        
+        Returns:
+            str: The authorization code.
+            
+        Raises:
+            Exception: If login fails.
         """
         auth_url = (
             f"https://api.upstox.com/v2/login/authorization/dialog?"
@@ -73,7 +106,7 @@ class UpstoxAuthenticator:
             if self.driver:
                 self.driver.quit()
 
-    def _create_webdriver(self):
+    def _create_webdriver(self) -> webdriver.Chrome:
         """
         Creates and configures a Selenium WebDriver instance.
 
@@ -108,7 +141,7 @@ class UpstoxAuthenticator:
         self.logger.error("Failed to create WebDriver after multiple attempts")
         raise Exception("Failed to create WebDriver after multiple attempts")
 
-    def _enter_phone_number(self):
+    def _enter_phone_number(self) -> None:
         """
         Enters phone number on the login page, requests OTP.
         """
@@ -126,7 +159,7 @@ class UpstoxAuthenticator:
         get_otp_button.click()
         self.logger.info("Phone number entered and OTP requested")
 
-    def _enter_totp(self):
+    def _enter_totp(self) -> None:
         """
         Generates and enters the TOTP code.
         """
@@ -144,7 +177,7 @@ class UpstoxAuthenticator:
         continue_button.click()
         self.logger.info("TOTP entered and continued")
 
-    def _enter_pin_code(self):
+    def _enter_pin_code(self) -> None:
         """
         Enters the 6-digit PIN to complete the login.
         """
@@ -163,6 +196,12 @@ class UpstoxAuthenticator:
     def _get_code_from_url(self, url: str) -> str:
         """
         Extracts authorization code from the redirected URL.
+        
+        Args:
+            url (str): The redirected URL containing the authorization code.
+            
+        Returns:
+            str: The authorization code.
         """
         parsed_url = urlparse(url)
         query_params = parse_qs(parsed_url.query)
@@ -173,6 +212,15 @@ class UpstoxAuthenticator:
     def _get_access_token(self, code: str) -> str:
         """
         Exchanges authorization code for an Upstox access token.
+        
+        Args:
+            code (str): The authorization code.
+            
+        Returns:
+            str: The access token.
+            
+        Raises:
+            Exception: If token exchange fails.
         """
         self.logger.info("Exchanging authorization code for access token")
         
