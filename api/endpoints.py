@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Dict, Any, Optional
 
 from brokers.factory import BrokerFactory
+from brokers.base.broker import BaseBroker
 from logger import get_logger
 
 router = APIRouter()
@@ -64,7 +65,7 @@ async def get_master_data(broker=Depends(get_broker)):
     try:
         # This assumes all brokers have a similar master_df attribute
         # In a real implementation, you might need broker-specific handling
-        master_data = broker.upstox_master_df.to_dicts()
+        master_data = broker.master_df.to_dicts()
         return {"status": "success", "data": master_data}
     except Exception as err:
         raise HTTPException(

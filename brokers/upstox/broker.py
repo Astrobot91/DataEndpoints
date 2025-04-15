@@ -29,8 +29,8 @@ class UpstoxBroker(BaseBroker):
         broker_name (str): The name of the broker ('Upstox').
         logger (logging.Logger): Logger instance for the broker.
         access_token (str): The current Upstox API access token.
-        upstox_master_data (Dict): The Upstox master data containing instrument information.
-        upstox_master_df (pl.DataFrame): DataFrame representation of the master data.
+        master_data (Dict): The Upstox master data containing instrument information.
+        master_df (pl.DataFrame): DataFrame representation of the master data.
     """
     
     BASE_URL = "https://api.upstox.com/v2"
@@ -58,9 +58,9 @@ class UpstoxBroker(BaseBroker):
         try:
             self.logger.info(f'Initializing UpstoxBroker')
             self.access_token = await self.fetch_access_token()
-            self.upstox_master_data = await self._get_upstox_master_data()
-            self.upstox_master_df = pl.DataFrame(data=self.upstox_master_data)
-            if self.upstox_master_df is None:
+            self.master_data = await self._get_upstox_master_data()
+            self.master_df = pl.DataFrame(data=self.master_data)
+            if self.master_df is None:
                 raise Exception("Instrument data could not be loaded.")
         except Exception as e:
             self.logger.error(f"Initialization failed: {e}")
@@ -91,7 +91,7 @@ class UpstoxBroker(BaseBroker):
                 exchange = data.get("exchange", "NSE") 
                 instrument_type = data.get("instrument_type", "")
 
-                instrument_rows = self.upstox_master_df.filter(
+                instrument_rows = self.master_df.filter(
                     (pl.col('exchange_token') == exchange_token),
                     (pl.col('exchange') == exchange),
                     (pl.col('instrument_type') == instrument_type)   
@@ -157,7 +157,7 @@ class UpstoxBroker(BaseBroker):
                 self.logger.error(f"Missing 'instrument_token' in quote data for key {ltp_data}")
                 continue
             try:
-                temp_df = self.upstox_master_df.filter(
+                temp_df = self.master_df.filter(
                     pl.col('instrument_key') == instrument_key
                 )
                 value["trading_symbol"] = temp_df["trading_symbol"][0]
@@ -202,7 +202,7 @@ class UpstoxBroker(BaseBroker):
             Exception: If data retrieval fails.
         """
         try:
-            instrument_rows = self.upstox_master_df.filter(
+            instrument_rows = self.master_df.filter(
                 (pl.col('exchange_token') == exchange_token),
                 (pl.col('exchange') == exchange),
                 (pl.col('instrument_type') == instrument_type)
@@ -367,7 +367,7 @@ class UpstoxBroker(BaseBroker):
             Exception: If quote retrieval fails.
         """
         try:
-            instrument_rows = self.upstox_master_df.filter(
+            instrument_rows = self.master_df.filter(
                 (pl.col('exchange_token') == exchange_token),
                 (pl.col('exchange') == exchange),
                 (pl.col('instrument_type') == instrument_type)
