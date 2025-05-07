@@ -15,6 +15,31 @@ from logger import get_logger
 router = APIRouter()
 
 
+def get_broker_config(broker_type: str) -> Dict[str, Any]:
+    """
+    Retrieve broker configuration based on broker type.
+    
+    Args:
+        broker_type (str): The type of broker to retrieve configuration for.
+        
+    Returns:
+        Dict[str, Any]: Broker configuration dictionary.
+    """
+    import os
+    import json
+    import boto3 
+
+    UPSTOX_CONFIG_SECRET_NAME = os.getenv("UPSTOX_CONFIG_SECRET_NAME", "my_upstox_config")
+    secrets_client = boto3.client("secretsmanager")
+
+    if broker_type.lower() == "upstox":
+        upstox_config_secret = secrets_client.get_secret_value(SecretId=UPSTOX_CONFIG_SECRET_NAME)
+        upstox_config_json = json.loads(upstox_config_secret["SecretString"])
+
+        return upstox_config_json
+    # Add other brokers as needed
+
+
 async def get_broker(broker_type: str = Query(..., description="Broker type (e.g., 'upstox', 'zerodha')")):
     """
     Dependency to get initialized broker instance based on type.
@@ -35,9 +60,13 @@ async def get_broker(broker_type: str = Query(..., description="Broker type (e.g
             log_group="DataPipeline",
             log_stream="broker",
         )
+
+        broker_config = get_broker_config(broker_type)
+
         broker = BrokerFactory.create_broker(
             broker_type=broker_type,
-            logger=logger
+            logger=logger,
+            config=broker_config
         )
         await broker.initialize()
         return broker

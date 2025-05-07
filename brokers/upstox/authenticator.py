@@ -94,7 +94,7 @@ class UpstoxAuthenticator(BaseAuthenticator):
             self._enter_totp()
             self._enter_pin_code()
 
-            time.sleep(10)  # Wait for the final redirect
+            time.sleep(10)  
             current_url = self.driver.current_url
             self.logger.info(f"Current URL after login: {current_url}")
             auth_code = self._get_code_from_url(current_url)

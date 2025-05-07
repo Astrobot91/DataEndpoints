@@ -75,7 +75,7 @@ async def startup_event():
     # Initialize token rotation service
     token_rotation_service = TokenRotationService(
         brokers=broker_config,
-        health_check_interval=5  # 5 seconds
+        health_check_interval=300  # 5 seconds
     )
     
     # Start token rotation service in background

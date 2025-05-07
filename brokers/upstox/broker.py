@@ -10,6 +10,7 @@ import boto3
 import json
 import logging
 import aiohttp
+import asyncio
 import polars as pl
 from io import BytesIO
 from datetime import datetime, timedelta
@@ -72,6 +73,8 @@ class UpstoxBroker(BaseBroker):
     async def ltp_quote(self, ltp_request_data: List[Dict[str, str]]) -> Dict[str, Any]:
         """
         Get last traded price quotes for specified instruments.
+        Handles chunking of requests to respect API limits (max 1000 instruments per request).
+        Rate limited to 1 request per second.
         
         Args:
             ltp_request_data (List[Dict[str, str]]): List of dictionaries containing
@@ -85,6 +88,7 @@ class UpstoxBroker(BaseBroker):
             Exception: If quote retrieval fails.
         """
         try:
+            # Process all instrument keys first
             instrument_key_list = []
             for data in ltp_request_data:
                 exchange_token = data.get("exchange_token", "")
@@ -92,9 +96,8 @@ class UpstoxBroker(BaseBroker):
                 instrument_type = data.get("instrument_type", "")
 
                 instrument_rows = self.master_df.filter(
-                    (pl.col('exchange_token') == exchange_token),
-                    (pl.col('exchange') == exchange),
-                    (pl.col('instrument_type') == instrument_type)   
+                    (pl.col('exchange_token') == int(exchange_token)),
+                    (pl.col('exchange') == f"{exchange}_{instrument_type}"),
                 )
                 if instrument_rows.is_empty():
                     error_msg = f'exchange_token: {exchange_token} not found in the upstox master file.'
@@ -102,37 +105,52 @@ class UpstoxBroker(BaseBroker):
                     raise ValueError(error_msg)
                 instrument_key = instrument_rows['instrument_key'][0]
                 instrument_key_list.append(instrument_key)
+
+            # Split into chunks of 550
+            CHUNK_SIZE = 750
+            chunks = [instrument_key_list[i:i + CHUNK_SIZE] 
+                     for i in range(0, len(instrument_key_list), CHUNK_SIZE)]
             
-            main_instrument_key = ",".join(instrument_key_list)
+            combined_response = {}
+            
+            for chunk in chunks:
+                main_instrument_key = ",".join(chunk)
+                
+                url = f'{self.BASE_URL}/market-quote/ltp'
+                headers = {
+                    'Authorization': f'Bearer {self.access_token}',
+                    'Accept': 'application/json'
+                }
+                params = {'instrument_key': main_instrument_key}
 
-            url = f'{self.BASE_URL}/market-quote/ltp'
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'Accept': 'application/json'
-            }
-            params = {'instrument_key': main_instrument_key}
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url=url, headers=headers, params=params) as response:
-                    if response.status == 200:
-                        ltp_response = await response.json()
-                        if ltp_response['status'] == 'success':
-                            if 'data' in ltp_response:
-                                data = await self.convert_quote(ltp_response_data=ltp_response['data'])
-                                return data
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url=url, headers=headers, params=params) as response:
+                        if response.status == 200:
+                            ltp_response = await response.json()
+                            if ltp_response['status'] == 'success':
+                                if 'data' in ltp_response:
+                                    chunk_data = await self.convert_quote(ltp_response_data=ltp_response['data'])
+                                    combined_response.update(chunk_data)
+                                else:
+                                    error_msg = f'LTP response data missing for: {params}'
+                                    self.logger.error(error_msg)
+                                    raise ValueError(error_msg)
                             else:
-                                error_msg = f'LTP response data missing for: {params}'
+                                error_msg = f'LTP response retrieval unsuccessful. Details: {ltp_response}'
                                 self.logger.error(error_msg)
-                                raise ValueError(error_msg)
+                                raise Exception(error_msg)
                         else:
-                            error_msg = f'LTP response retrieval unsuccessful. Details: {ltp_response}'
+                            error_text = await response.text()
+                            error_msg = f'Failed to retrieve LTP response: {response.status} - {error_text}, Headers: {headers}, Params: {params}'
                             self.logger.error(error_msg)
                             raise Exception(error_msg)
-                    else:
-                        error_text = await response.text()
-                        error_msg = f'Failed to retrieve LTP response: {response.status} - {error_text}'
-                        self.logger.error(error_msg)
-                        raise Exception(error_msg)
+                            
+                # Rate limiting - wait 1 second between chunks
+                if chunks.index(chunk) < len(chunks) - 1:  # Don't wait after the last chunk
+                    await asyncio.sleep(1)
+                    
+            return combined_response
+
         except Exception as e:
             self.logger.error(f'Exception during LTP response retrieval: {e}')
             raise
@@ -160,8 +178,8 @@ class UpstoxBroker(BaseBroker):
                 temp_df = self.master_df.filter(
                     pl.col('instrument_key') == instrument_key
                 )
-                value["trading_symbol"] = temp_df["trading_symbol"][0]
-                value["instrument_type"] = temp_df["instrument_type"][0]
+                value["trading_symbol"] = temp_df["tradingsymbol"][0]
+                value["instrument_type"] = temp_df["exchange"][0].split("_")[1] 
                 if temp_df.is_empty():
                     self.logger.error(f"No matching instrument for token {instrument_key}")
                     continue
@@ -182,9 +200,11 @@ class UpstoxBroker(BaseBroker):
             interval: str,
             from_date: str,
             to_date: str
-            ) -> Dict[str, Any]:
+            ) -> List[Dict[str, Any]]:
         """
         Get historical candle data for a specified instrument.
+        Handles chunking of requests to respect API limits (max 1000 days per request).
+        Rate limited to 1 request per second.
         
         Args:
             exchange (str): Exchange name (e.g., 'NSE', 'BSE').
@@ -195,65 +215,104 @@ class UpstoxBroker(BaseBroker):
             to_date (str): End date in 'YYYY-MM-DD' format.
             
         Returns:
-            Dict[str, Any]: Dictionary containing historical candle data.
-            
-        Raises:
-            ValueError: If parameters are invalid.
-            Exception: If data retrieval fails.
+            List[Dict[str, Any]]: List of dictionaries containing historical candle data
+            with datetime, open, high, low, close, volume, oi fields.
         """
         try:
+            # Validate instrument exists
             instrument_rows = self.master_df.filter(
-                (pl.col('exchange_token') == exchange_token),
-                (pl.col('exchange') == exchange),
-                (pl.col('instrument_type') == instrument_type)
+                (pl.col('exchange_token') == int(exchange_token)),
+                (pl.col('exchange') == f"{exchange}_{instrument_type}"),
             )
             if instrument_rows.is_empty():
                 error_msg = f"exchange_token: {exchange_token} not found in upstox master file."
                 self.logger.error(error_msg)
                 raise ValueError(error_msg)
-            instrument_key = instrument_rows['instrument_key'][0]  
+            instrument_key = instrument_rows['instrument_key'][0]
 
-            url = f'{self.BASE_URL}/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}'
-            headers = {
-                'Accept': 'application/json'
-            }
-            params = {
-                'instrument_key': instrument_key,
-                'interval': interval,
-                'from_date': from_date,
-                'to_date': to_date
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url=url, headers=headers, params=params) as response:
-                    if response.status == 200:
-                        hist_response = await response.json()
-                        if hist_response.get('status') == 'success':
-                            if 'data' in hist_response:
-                                data = await self._convert_to_polars_df(
-                                    data=hist_response['data'],
-                                    exchange=exchange,
-                                    exchange_token=exchange_token,
-                                    instrument_type=instrument_type,
-                                    interval=interval,
-                                    from_date=from_date,
-                                    to_date=to_date
-                                )
-                                self.logger.info(f'Historical data for: {exchange_token} from: {from_date} to: {to_date} retrieved.')
-                                return data.to_dicts()
+            # Split date range into chunks of 1000 days
+            from_dt = datetime.strptime(from_date, "%Y-%m-%d")
+            to_dt = datetime.strptime(to_date, "%Y-%m-%d")
+            date_chunks = []
+            chunk_start = from_dt
+            
+            while chunk_start < to_dt:
+                chunk_end = min(chunk_start + timedelta(days=999), to_dt)
+                date_chunks.append((
+                    chunk_start.strftime("%Y-%m-%d"),
+                    chunk_end.strftime("%Y-%m-%d")
+                ))
+                chunk_start = chunk_end + timedelta(days=1)
+
+            self.logger.info(f'Processing {len(date_chunks)} chunks for historical data')
+            combined_df = None
+
+            for i, (chunk_from, chunk_to) in enumerate(date_chunks, 1):
+                url = f'{self.BASE_URL}/historical-candle/{instrument_key}/{interval}/{chunk_to}/{chunk_from}'
+                headers = {
+                    'Accept': 'application/json'
+                }
+                params = {
+                    'instrument_key': instrument_key,
+                    'interval': interval,
+                    'from_date': chunk_from,
+                    'to_date': chunk_to
+                }
+
+                self.logger.debug(f'Processing chunk {i} of {len(date_chunks)} ({chunk_from} to {chunk_to})')
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url=url, headers=headers, params=params) as response:
+                        if response.status == 200:
+                            hist_response = await response.json()
+                            if hist_response.get('status') == 'success':
+                                if 'data' in hist_response:
+                                    chunk_df = await self._convert_to_polars_df(
+                                        data=hist_response['data'],
+                                        exchange=exchange,
+                                        exchange_token=exchange_token,
+                                        instrument_type=instrument_type,
+                                        interval=interval,
+                                        from_date=chunk_from,
+                                        to_date=chunk_to
+                                    )
+                                    if not chunk_df.is_empty():
+                                        if combined_df is None:
+                                            combined_df = chunk_df
+                                        else:
+                                            combined_df = pl.concat([combined_df, chunk_df])
+                                else:
+                                    self.logger.warning(f'No data for chunk {i} ({chunk_from} to {chunk_to})')
                             else:
-                                error_msg = f'Response data missing for historical data: {params}'
-                                self.logger.error(error_msg)
-                                raise ValueError(error_msg)
-
+                                self.logger.warning(f'Unsuccessful response for chunk {i}: {hist_response}')
                         else:
-                            error_msg = f'Retrieving historical data unsuccessful. Details: {hist_response}'
-                            self.logger.error(error_msg)
-                            raise Exception(error_msg)
-                    else:
-                        error_text = await response.text()
-                        error_msg = f'Failed to retrieve historical data: {response.status} - {error_text}'
-                        self.logger.error(error_msg)
-                        return {}
+                            error_text = await response.text()
+                            self.logger.warning(f'Failed to retrieve chunk {i}: {response.status} - {error_text}')
+
+                # Rate limiting - wait 1 second between chunks
+                if i < len(date_chunks):  # Don't wait after the last chunk
+                    await asyncio.sleep(1)
+
+            # Return sorted results if we have data
+            if combined_df is not None and not combined_df.is_empty():
+                self.logger.info(f'Successfully processed {len(date_chunks)} chunks')
+                # Ensure only required columns in correct order
+                combined_df = combined_df.select([
+                    "datetime", "open", "high", "low", "close", "volume", "oi"
+                ])
+                combined_df = combined_df.with_columns([
+                    pl.col("open").cast(pl.Float64),
+                    pl.col("high").cast(pl.Float64),
+                    pl.col("low").cast(pl.Float64),
+                    pl.col("close").cast(pl.Float64),
+                    pl.col("volume").cast(pl.Int64),
+                    pl.col("oi").cast(pl.Int64)
+                ]).sort('datetime')
+                
+                return combined_df.to_dicts()
+            else:
+                self.logger.warning(f'No historical data found for any chunk')
+                return []
+
         except Exception as e:
             self.logger.error(f'Exception while retrieving historical data: {e}')  
             raise
@@ -281,7 +340,7 @@ class UpstoxBroker(BaseBroker):
             to_date (str): The end date for the historical data in 'YYYY-MM-DD' format.
 
         Returns:
-            pl.DataFrame: Polars DataFrame with adjusted datetime column.
+            pl.DataFrame: Polars DataFrame with columns: datetime, open, high, low, close, volume, oi
         """
         candles = data.get('candles', [])
         if candles:
@@ -294,56 +353,84 @@ class UpstoxBroker(BaseBroker):
                 "volume": [item[5] for item in candles],
                 "oi": [item[6] for item in candles],
             }
-            df = pl.DataFrame(data_dict, strict=False)
-            df = df.with_columns(
+            df = pl.DataFrame(data_dict)
+            df = df.with_columns([
                 pl.col("datetime")
                 .str.strptime(pl.Datetime)
                 .dt.convert_time_zone("Asia/Kolkata")
-                .dt.strftime("%Y-%m-%d %H:%M:%S")
-            )
-            todays_mkt_quote = await self.full_market_quote(
-                exchange_token=exchange_token, 
-                exchange=exchange, 
-                instrument_type=instrument_type
-            )
-            if todays_mkt_quote['ohlc']:
-                row = {
-                    'datetime': todays_mkt_quote['timestamp'],
-                    'open': todays_mkt_quote['ohlc']['open'],
-                    'high': todays_mkt_quote['ohlc']['high'],
-                    'low': todays_mkt_quote['ohlc']['low'],
-                    'close': todays_mkt_quote['ohlc']['close'],
-                    'volume': todays_mkt_quote['volume'],
-                    'oi': todays_mkt_quote['oi'],
-                }
+                .dt.strftime("%Y-%m-%d %H:%M:%S"),
+                pl.col("open").cast(pl.Float64),
+                pl.col("high").cast(pl.Float64),
+                pl.col("low").cast(pl.Float64),
+                pl.col("close").cast(pl.Float64),
+                pl.col("volume").cast(pl.Int64),
+                pl.col("oi").cast(pl.Int64)
+            ])
 
-                todays_df = pl.DataFrame(row)
-                todays_df = todays_df.with_columns(
-                    pl.col('datetime')
-                    .str.strptime(pl.Datetime)
-                    .dt.convert_time_zone("Asia/Kolkata")
-                    .dt.strftime("%Y-%m-%d %H:%M:%S")
-                )
+            # Check if we need today's data
+            if to_date == datetime.now().strftime("%Y-%m-%d"):
+                today_date = datetime.now().strftime("%Y-%m-%d")
+                has_todays_data = df.filter(
+                    pl.col("datetime").str.contains(today_date)
+                ).height > 0
 
-                todays_df = todays_df.with_columns([
-                    pl.col("open").cast(pl.Float64),
-                    pl.col("high").cast(pl.Float64),
-                    pl.col("low").cast(pl.Float64),
-                    pl.col("close").cast(pl.Float64),
-                    pl.col("volume").cast(pl.Int64),
-                    pl.col("oi").cast(pl.Int64)
-                ])
-                
-                if to_date == datetime.now().strftime("%Y-%m-%d"):
-                    combined_df = pl.concat([df, todays_df])
-                combined_df = combined_df.sort('datetime')
-                return combined_df
-            else:
-                self.logger.warning(f"Current day's full market quote not added for exchange token: {exchange_token}.")
-                return df
+                if not has_todays_data:
+                    todays_mkt_quote = await self.full_market_quote(
+                        exchange_token=exchange_token, 
+                        exchange=exchange, 
+                        instrument_type=instrument_type
+                    )
+                    if todays_mkt_quote.get('ohlc'):
+                        if todays_mkt_quote.get('timestamp'):  # Validate timestamp exists
+                            row = {
+                                'datetime': todays_mkt_quote['timestamp'],
+                                'open': todays_mkt_quote['ohlc']['open'],
+                                'high': todays_mkt_quote['ohlc']['high'],
+                                'low': todays_mkt_quote['ohlc']['low'],
+                                'close': todays_mkt_quote['ohlc']['close'],
+                                'volume': todays_mkt_quote['volume'],
+                                'oi': todays_mkt_quote['oi'],
+                            }
+
+                            todays_df = pl.DataFrame(row)
+                            todays_df = todays_df.with_columns([
+                                pl.col('datetime')
+                                .str.strptime(pl.Datetime)
+                                .dt.convert_time_zone("Asia/Kolkata")
+                                .dt.strftime("%Y-%m-%d %H:%M:%S"),
+                                pl.col("open").cast(pl.Float64),
+                                pl.col("high").cast(pl.Float64),
+                                pl.col("low").cast(pl.Float64),
+                                pl.col("close").cast(pl.Float64),
+                                pl.col("volume").cast(pl.Int64),
+                                pl.col("oi").cast(pl.Int64)
+                            ])
+                            
+                            df = pl.concat([df, todays_df])
+                        else:
+                            self.logger.warning(f"Current day's timestamp missing for exchange token: {exchange_token}")
+                    else:
+                        self.logger.warning(f"Current day's full market quote not available for exchange token: {exchange_token}")
+                else:
+                    self.logger.debug(f"Current day's data already exists in historical data for exchange token: {exchange_token}")
+
+            # Ensure only required columns in correct order
+            df = df.select([
+                "datetime", "open", "high", "low", "close", "volume", "oi"
+            ]).sort('datetime')
+            
+            return df
         else:
             self.logger.warning(f"Historical data for exchange token: {exchange_token} from: {from_date} to: {to_date} at interval: {interval} not found.")
-            return pl.DataFrame(data={}, strict=False)
+            return pl.DataFrame(schema={
+                "datetime": str,
+                "open": float,
+                "high": float,
+                "low": float,
+                "close": float,
+                "volume": int,
+                "oi": int
+            })
 
     async def full_market_quote(
         self,
@@ -390,8 +477,9 @@ class UpstoxBroker(BaseBroker):
                     if response.status == 200:
                         quote_response = await response.json()
                         if quote_response.get('status') == 'success':
-                            if 'data' in quote_response and instrument_key in quote_response['data']:
-                                return quote_response['data'][instrument_key]
+                            updated_instrument_key = instrument_key.replace("|", ":")
+                            if 'data' in quote_response and updated_instrument_key in quote_response['data']:
+                                return quote_response['data'][updated_instrument_key]
                             else:
                                 error_msg = f'Quote data missing for instrument: {instrument_key}'
                                 self.logger.error(error_msg)
