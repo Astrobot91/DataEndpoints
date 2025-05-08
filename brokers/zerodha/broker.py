@@ -122,23 +122,26 @@ class ZerodhaBroker(BaseBroker):
                     (pl.col('exchange_token') == int(exchange_token)) &
                     (pl.col('exchange') == exchange)
                 )
+               
                 if instrument_rows.is_empty():
                     error_msg = f"exchange_token: {exchange_token} not found in master data."
                     self.logger.error(error_msg)
                     raise ValueError(error_msg)
                 trading_symbol = instrument_rows['tradingsymbol'][0]
                 instrument_key_list.append(f"{exchange}:{trading_symbol}")
+              
 
             # Chunk requests to avoid URL length limits
             CHUNK_SIZE = 750
             combined_response = {}
             for chunk in [instrument_key_list[i:i+CHUNK_SIZE] for i in range(0, len(instrument_key_list), CHUNK_SIZE)]:
-                params = {'instrument_key': ",".join(chunk)}
+                params =[('i', key) for key in chunk]
                 url = f"{self.BASE_URL}quote/ltp"
                 headers = {
-                    'Authorization': f"Bearer {self.access_token}",
-                    'Accept': 'application/json'
-                }
+                    "Authorization": f"token {self.ZERODHA_API_KEY}:{self.access_token}",
+                    "X-Kite-Version": "3",
+                    }
+                print(params)
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url=url, headers=headers, params=params) as response:
                         if response.status != 200:
@@ -147,7 +150,7 @@ class ZerodhaBroker(BaseBroker):
                         resp_json = await response.json()
                         if resp_json.get('status') != 'success' or 'data' not in resp_json:
                             raise Exception(f"LTP API error: {resp_json}")
-                        combined_response.update(await self.convert_quote(resp_json['data']))
+                        return resp_json['data']
                 await asyncio.sleep(1)
             return combined_response
 
@@ -166,6 +169,43 @@ class ZerodhaBroker(BaseBroker):
         return await super().historical_data(
             exchange, exchange_token, instrument_type, interval, from_date, to_date
         )
+    
+    async def convert_quote(self, response_data: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """
+        Converts instrument tokens in the quote data to exchange tokens.
+
+        Args:
+            ltp_response_data (dict): A dictionary where each value contains quote data with an 'instrument_token' key.
+
+        Returns:
+            dict: A dictionary with trading symbols as keys and quote data as values.
+
+        Raises:
+            Exception: If an error occurs during the conversion process.
+        """
+        output_dict = {}
+        for ltp_data, value in response_data.items():
+            instrument_key = value['']
+            if instrument_key is None:
+                self.logger.error(f"Missing 'instrument_token' in quote data for key {ltp_data}")
+                continue
+            try:
+                temp_df = self.master_df.filter(
+                    pl.col('exchange_token') == instrument_key
+                )
+                value["tradingsymbol"] = temp_df["tradingsymbol"][0]
+                value["instrument_type"] = temp_df["exchange"][0].split("_")[1] 
+                if temp_df.is_empty():
+                    self.logger.error(f"No matching instrument for token {instrument_key}")
+                    continue
+                new_key = temp_df['exchange_token'][0]
+                output_dict[new_key] = value
+
+            except Exception as e:
+                self.logger.error(f"Error converting instrument token {instrument_key}: {e}")
+                raise
+        
+        return output_dict
 
     async def full_market_quote(self, exchange_token, exchange, instrument_type):
         """
