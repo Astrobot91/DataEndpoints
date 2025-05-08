@@ -70,14 +70,14 @@ class UpstoxBroker(BaseBroker):
     async def _get_upstox_master_data(self):
         return await super()._get_upstox_master_data()
 
-    async def ltp_quote(self, ltp_request_data: List[Dict[str, str]]) -> Dict[str, Any]:
+    async def ltp_quote(self, request_data: List[Dict[str, str]]) -> Dict[str, Any]:
         """
         Get last traded price quotes for specified instruments.
         Handles chunking of requests to respect API limits (max 1000 instruments per request).
         Rate limited to 1 request per second.
         
         Args:
-            ltp_request_data (List[Dict[str, str]]): List of dictionaries containing
+            request_data (List[Dict[str, str]]): List of dictionaries containing
                 instrument identifiers like exchange_token, exchange, etc.
                 
         Returns:
@@ -90,7 +90,7 @@ class UpstoxBroker(BaseBroker):
         try:
             # Process all instrument keys first
             instrument_key_list = []
-            for data in ltp_request_data:
+            for data in request_data:
                 exchange_token = data.get("exchange_token", "")
                 exchange = data.get("exchange", "NSE") 
                 instrument_type = data.get("instrument_type", "")
@@ -106,7 +106,6 @@ class UpstoxBroker(BaseBroker):
                 instrument_key = instrument_rows['instrument_key'][0]
                 instrument_key_list.append(instrument_key)
 
-            # Split into chunks of 550
             CHUNK_SIZE = 750
             chunks = [instrument_key_list[i:i + CHUNK_SIZE] 
                      for i in range(0, len(instrument_key_list), CHUNK_SIZE)]
@@ -129,7 +128,7 @@ class UpstoxBroker(BaseBroker):
                             ltp_response = await response.json()
                             if ltp_response['status'] == 'success':
                                 if 'data' in ltp_response:
-                                    chunk_data = await self.convert_quote(ltp_response_data=ltp_response['data'])
+                                    chunk_data = await self.convert_quote(response_data=ltp_response['data'])
                                     combined_response.update(chunk_data)
                                 else:
                                     error_msg = f'LTP response data missing for: {params}'
@@ -155,7 +154,212 @@ class UpstoxBroker(BaseBroker):
             self.logger.error(f'Exception during LTP response retrieval: {e}')
             raise
 
-    async def convert_quote(self, ltp_response_data: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    async def ohlc_quote(
+            self,
+            request_data: List[Dict[str, str]],
+            interval: str = "1d"  # Added interval parameter with a default
+    ) -> Dict[str, Any]:   
+        """
+        Get OHLC quotes for multiple instruments.
+        Handles chunking of requests to respect API limits (max 500 instruments per request, using chunks of 450).
+        Rate limited to 1 request per second.
+
+        Args:
+            request_data (List[Dict[str, str]]): List of dictionaries, each containing
+                instrument identifiers like 'exchange_token', 'exchange', 'instrument_type'.
+            interval (str): Interval for OHLC data. Possible values: '1d', 'I1', 'I30'.
+                            Defaults to '1d'.
+
+        Returns:
+            Dict[str, Any]: Dictionary containing OHLC quote data for each requested instrument,
+                            keyed by their original instrument_key (after conversion).
+
+        Raises:
+            ValueError: If any instrument identifiers are invalid or not found, or if interval is invalid.
+            Exception: If quote retrieval fails for any chunk.
+        """
+        try:
+            valid_intervals = ["1d", "I1", "I30"]
+            if interval not in valid_intervals:
+                error_msg = f"Invalid interval: {interval}. Valid intervals are: {valid_intervals}"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
+
+            instrument_key_list = []
+            for data in request_data:
+                exchange_token = data.get("exchange_token", "")
+                exchange = data.get("exchange", "NSE") 
+                instrument_type = data.get("instrument_type", "")
+                
+                instrument_rows = self.master_df.filter(
+                    (pl.col('exchange_token') == int(exchange_token)),
+                    (pl.col('exchange') == f"{exchange}_{instrument_type}"),
+                )
+                if instrument_rows.is_empty():
+                    error_msg = f'exchange_token: {exchange_token} not found in the upstox master file.'
+                    self.logger.error(error_msg)
+                    raise ValueError(error_msg)
+                instrument_key = instrument_rows['instrument_key'][0]
+                instrument_key_list.append(instrument_key)
+
+            CHUNK_SIZE = 450
+            chunks = [
+                instrument_key_list[i:i + CHUNK_SIZE]
+                for i in range(0, len(instrument_key_list), CHUNK_SIZE)]
+
+            combined_response = {}
+            
+            for i, chunk in enumerate(chunks, 1): 
+                if not chunk: 
+                    continue
+
+                main_instrument_key = ",".join(chunk)
+
+                url = f'{self.BASE_URL}/market-quote/ohlc'
+                headers = {
+                    'Authorization': f'Bearer {self.access_token}',
+                    'Accept': 'application/json'
+                }
+                params = {
+                    'instrument_key': main_instrument_key,
+                    'interval': interval
+                }
+                self.logger.debug(f"Requesting OHLC for chunk {i}/{len(chunks)} with interval {interval}")
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url=url, headers=headers, params=params) as response:
+                        if response.status == 200:
+                            ohlc_api_response = await response.json()
+                            if ohlc_api_response.get('status') == 'success':
+                                if 'data' in ohlc_api_response:
+                                    chunk_data = await self.convert_quote(response_data=ohlc_api_response['data']) 
+                                    combined_response.update(chunk_data)
+                                else:
+                                    error_msg = f"OHLC response data missing for chunk {i}: {params}"
+                                    self.logger.error(error_msg)
+                                    raise ValueError(error_msg)
+                            else:
+                                error_msg = f"OHLC response retrieval unsuccessful for chunk {i}. Details: {ohlc_api_response}"
+                                self.logger.error(error_msg)
+                                raise Exception(error_msg)                                
+                        elif response.status == 429: # Rate limit
+                            self.logger.warning(f"Rate limit hit on ohlc_quote chunk {i}. Waiting 60s.")
+                            await asyncio.sleep(60)
+                            error_msg = f"Rate limit hit on ohlc_quote chunk {i} (not retried)."
+                            self.logger.error(error_msg)
+                            raise Exception(error_msg)
+                        else:
+                            error_text = await response.text()
+                            error_msg = f"Failed to retrieve OHLC response for chunk {i}: HTTP {response.status} - {error_text}. Params: {params}"
+                            self.logger.error(error_msg)
+                            raise Exception(error_msg)            
+
+                # Rate limiting - wait 1 second between chunks
+                if i < len(chunks):  # Use 'i' from enumerate
+                    self.logger.debug(f"Waiting 1 second before next OHLC chunk...")
+                    await asyncio.sleep(1)
+
+            self.logger.info(f"Successfully retrieved OHLC quotes for {len(combined_response)} instruments.")
+            return combined_response
+
+        except ValueError as ve:
+            self.logger.error(f"ValueError in ohlc_quote: {ve}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Exception during ohlc quote retrieval: {e}")
+            raise
+
+    async def full_market_quote(
+        self,
+        request_data: List[Dict[str, str]]
+    ) -> Dict[str, Any]:
+        """
+        Get full market quotes for multiple instruments.
+        Handles chunking of requests to respect API limits (max 500 instruments per request, using chunks of 450).
+        Rate limited to 1 request per second.
+
+        Args:
+            quote_request_data (List[Dict[str, str]]): List of dictionaries, each containing
+                instrument identifiers like 'exchange_token', 'exchange', 'instrument_type'.
+
+        Returns:
+            Dict[str, Any]: Dictionary containing full market quote data for each requested instrument,
+                            keyed by their original instrument_key.
+
+        Raises:
+            ValueError: If any instrument identifiers are invalid or not found.
+            Exception: If quote retrieval fails for any chunk.
+        """
+        try:
+            instrument_key_list = []
+            for data in request_data:
+                exchange_token = data.get("exchange_token", "")
+                exchange = data.get("exchange", "NSE") 
+                instrument_type = data.get("instrument_type", "")
+
+                instrument_rows = self.master_df.filter(
+                    (pl.col('exchange_token') == int(exchange_token)),
+                    (pl.col('exchange') == f"{exchange}_{instrument_type}"),
+                )
+                if instrument_rows.is_empty():
+                    error_msg = f'exchange_token: {exchange_token} not found in the upstox master file.'
+                    self.logger.error(error_msg)
+                    raise ValueError(error_msg)
+                instrument_key = instrument_rows['instrument_key'][0]
+                instrument_key_list.append(instrument_key)
+
+            CHUNK_SIZE = 450
+            chunks = [
+                instrument_key_list[i:i + CHUNK_SIZE]
+                for i in range(0, len(instrument_key_list), CHUNK_SIZE)]
+
+            combined_response = {}
+            
+            for chunk in chunks:
+                main_instrument_key = ",".join(chunk)
+
+                url = f'{self.BASE_URL}/market-quote/quotes'
+                headers = {
+                    'Authorization': f'Bearer {self.access_token}',
+                    'Accept': 'application/json'
+                }
+                params = {'instrument_key': main_instrument_key}
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url=url, headers=headers, params=params) as response:
+                        if response.status == 200:
+                            quote_api_response = await response.json()
+                            if quote_api_response.get('status') == 'success':
+                                if 'data' in quote_api_response:
+                                    chunk_data = await self.convert_quote(response_data=quote_api_response['data'])
+                                    combined_response.update(chunk_data)
+                                else:
+                                    error_msg = f"Full market quote response data missing for: {params}"
+                                    self.logger.error(error_msg)
+                                    raise ValueError(error_msg)
+                            else:
+                                error_msg = f"Full market quote response retrieval unsuccessful. Details: {quote_api_response}"
+                                self.logger.error(error_msg)
+                                raise Exception(error_msg)                                
+                        else:
+                            error_text = await response.text()
+                            error_msg = f"Failed to retrieve full market quote response: {response.status} - {error_text}, Headers: {headers}, Params: {params}"
+                            self.logger.error(error_msg)
+                            raise Exception(error_msg)
+                
+                # Rate limiting - wait 1 second between chunks
+                if chunks.index(chunk) < len(chunks) - 1:  # Don't wait after the last chunk
+                    await asyncio.sleep(1)
+
+            return combined_response
+
+        except ValueError as ve:
+            self.logger.error(f"ValueError in full_market_quote: {ve}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Exception during full market quote retrieval: {e}")
+            raise
+
+    async def convert_quote(self, response_data: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         """
         Converts instrument tokens in the quote data to exchange tokens.
 
@@ -169,7 +373,7 @@ class UpstoxBroker(BaseBroker):
             Exception: If an error occurs during the conversion process.
         """
         output_dict = {}
-        for ltp_data, value in ltp_response_data.items():
+        for ltp_data, value in response_data.items():
             instrument_key = value['instrument_token']
             if instrument_key is None:
                 self.logger.error(f"Missing 'instrument_token' in quote data for key {ltp_data}")
@@ -431,71 +635,6 @@ class UpstoxBroker(BaseBroker):
                 "volume": int,
                 "oi": int
             })
-
-    async def full_market_quote(
-        self,
-        exchange_token: str,
-        exchange: str,
-        instrument_type: str
-    ) -> Dict[str, Any]:
-        """
-        Get full market quote for a specified instrument.
-        
-        Args:
-            exchange_token (str): Exchange token for the instrument.
-            exchange (str): Exchange name (e.g., 'NSE', 'BSE').
-            instrument_type (str): Type of instrument (e.g., 'EQ', 'FUT').
-            
-        Returns:
-            Dict[str, Any]: Dictionary containing full market quote data.
-            
-        Raises:
-            ValueError: If parameters are invalid.
-            Exception: If quote retrieval fails.
-        """
-        try:
-            instrument_rows = self.master_df.filter(
-                (pl.col('exchange_token') == exchange_token),
-                (pl.col('exchange') == exchange),
-                (pl.col('instrument_type') == instrument_type)
-            )
-            if instrument_rows.is_empty():
-                error_msg = f"exchange_token: {exchange_token} not found in upstox master file."
-                self.logger.error(error_msg)
-                raise ValueError(error_msg)
-            instrument_key = instrument_rows['instrument_key'][0]
-
-            url = f'{self.BASE_URL}/market-quote/quotes'
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'Accept': 'application/json'
-            }
-            params = {'instrument_key': instrument_key}
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url=url, headers=headers, params=params) as response:
-                    if response.status == 200:
-                        quote_response = await response.json()
-                        if quote_response.get('status') == 'success':
-                            updated_instrument_key = instrument_key.replace("|", ":")
-                            if 'data' in quote_response and updated_instrument_key in quote_response['data']:
-                                return quote_response['data'][updated_instrument_key]
-                            else:
-                                error_msg = f'Quote data missing for instrument: {instrument_key}'
-                                self.logger.error(error_msg)
-                                return {}
-                        else:
-                            error_msg = f'Quote retrieval unsuccessful. Details: {quote_response}'
-                            self.logger.error(error_msg)
-                            raise Exception(error_msg)
-                    else:
-                        error_text = await response.text()
-                        error_msg = f'Failed to retrieve quote: {response.status} - {error_text}'
-                        self.logger.error(error_msg)
-                        return {}
-        except Exception as e:
-            self.logger.error(f'Exception during quote retrieval: {e}')
-            return {}
 
     async def fetch_access_token(self) -> str:
         """

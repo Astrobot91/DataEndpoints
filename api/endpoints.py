@@ -130,7 +130,7 @@ async def get_ltp_quote(
     ```
     """
     try:
-        ltp_data = await broker.ltp_quote(ltp_request_data=instruments)
+        ltp_data = await broker.ltp_quote(request_data=instruments)
         if not ltp_data:
             raise HTTPException(
                 status_code=404,
@@ -148,6 +148,95 @@ async def get_ltp_quote(
             detail=f"Error fetching LTP data: {str(err)}"
         )
 
+@router.post("/ohlc-quote")
+async def get_ohlc_quote(
+    instruments: List[Dict[str, str]],
+    broker=Depends(get_broker)
+):
+    """
+    Get OHLC market quote for multiple instruments.
+    
+    Args:
+        instruments: List of instrument identifiers.
+        broker: The broker instance from the dependency.
+        
+    Returns:
+        Dict: Response containing OHLC Quote data.
+        
+    Raises:
+        HTTPException: If data retrieval fails.
+    
+    Example Request Body:
+    ```json
+    [
+        {"exchange_token": "21195", "exchange": "NSE", "instrument_type": "EQ"},
+        {"exchange_token": "9305", "exchange": "NSE", "instrument_type": "FUTIDX"},
+    ]
+    ```
+    """
+    try:
+        ohlc_quote_data = await broker.ohlc_quote(request_data=instruments)
+        if not ohlc_quote_data:
+            raise HTTPException(
+                status_code=404,
+                detail="No data found for the provided instruments."
+            )
+        return {"status": "success", "data": ohlc_quote_data}
+    except ValueError as err:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid request: {str(err)}"
+        )
+    except Exception as err:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching OHLC data: {str(err)}"
+        )
+
+@router.post("/full-mkt-quote")
+async def get_full_mkt_quote(
+    instruments: List[Dict[str, str]],
+    broker=Depends(get_broker)
+):
+    """
+    Get full market quote for multiple instruments.
+    
+    Args:
+        instruments: List of instrument identifiers.
+        broker: The broker instance from the dependency.
+        
+    Returns:
+        Dict: Response containing Full Mkt Quote data.
+        
+    Raises:
+        HTTPException: If data retrieval fails.
+    
+    Example Request Body:
+    ```json
+    [
+        {"exchange_token": "21195", "exchange": "NSE", "instrument_type": "EQ"},
+        {"exchange_token": "9305", "exchange": "NSE", "instrument_type": "FUTIDX"},
+    ]
+    ```
+    """
+    try:
+        market_quote_data = await broker.full_market_quote(request_data=instruments)
+        if not market_quote_data:
+            raise HTTPException(
+                status_code=404,
+                detail="No data found for the provided instruments."
+            )
+        return {"status": "success", "data": market_quote_data}
+    except ValueError as err:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid request: {str(err)}"
+        )
+    except Exception as err:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching Full Mkt Quote data: {str(err)}"
+        )
 
 @router.post("/historical-data")
 async def historical_data(
@@ -214,3 +303,4 @@ async def historical_data(
             status_code=500,
             detail=f"Error fetching historical data: {str(err)}"
         )
+

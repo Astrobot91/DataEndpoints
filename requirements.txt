@@ -11,3 +11,5 @@ aiohttp
 requests
 fastapi
 uvicorn
+pytest
+pytest-asyncio
