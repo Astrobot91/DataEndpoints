@@ -43,15 +43,16 @@ app.add_middleware(
 app.include_router(api_router, prefix="/api/v1", tags=["data"])
 
 # Broker configuration
-UPSTOX_CONFIG_SECRET_NAME = os.getenv("UPSTOX_CONFIG_SECRET_NAME", "my_upstox_config")
-
 secrets_client = boto3.client("secretsmanager")
 
-upstox_config_secret = secrets_client.get_secret_value(SecretId=UPSTOX_CONFIG_SECRET_NAME)
+upstox_config_secret = secrets_client.get_secret_value(SecretId="my_upstox_config")
+zerodha_config_secret = secrets_client.get_secret_value(SecretId="my_zerodha_config")
+
 upstox_config_json = json.loads(upstox_config_secret["SecretString"])
+zerodha_config_json = json.loads(zerodha_config_secret["SecretString"])
 
 broker_config = {
-    "upstox": upstox_config_json
+    "zerodha": zerodha_config_json
     # Add other brokers as needed
     # "zerodha": zerodha_config_json,
     # "dhan": dhan_config_json

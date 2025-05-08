@@ -57,11 +57,13 @@ class TokenRotationService:
         self.logger.info("Initializing token rotation service")
         for broker_type, config in self.brokers.items():
             try:
+                
                 logger = get_logger(
                     name=f"{broker_type.capitalize()}Broker",
                     log_group="DataPipeline",
                     log_stream=f"broker"
                 )
+
                 broker = BrokerFactory.create_broker(
                     broker_type=broker_type,
                     config=config,
@@ -128,7 +130,7 @@ class TokenRotationService:
             # Make a lightweight API call to check token health
             # This is a simplified implementation
             # In a real environment, you would use a specific endpoint for health checks
-            test_instruments = [{"exchange_token": "26000", "exchange": "NSE", "instrument_type": "INDEX"}]
+            test_instruments = [{"exchange_token": "1333", "exchange": "NSE", "instrument_type": "EQUITY"}]
             await broker.ltp_quote(test_instruments)
             return True
         except Exception as e:
